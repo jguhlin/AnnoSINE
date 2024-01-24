@@ -11,13 +11,15 @@ input_genome_assembly_path = args.input_filename
 
 # Supplemental Dataset 1. Python script of the SINE-Finder.
 
+# 2024-01-24: Minor updates by Joseph Guhlin to improve parallel processing
+
 # sine_finder
 
 # meta
 
 __program_name__ = "sine_finder.py"
-__version_no__ = "1.0.1"
-__version_date__ = "2010-09-28"
+__version_no__ = "1.0.2"
+__version_date__ = "2024-01-24"
 
 #################
 # CONFIGURATION #
@@ -50,7 +52,10 @@ extensions = ('fas', 'fasta', 'mfa',)
 ###########
 
 import string, re, os, sys, time
+from itertools import repeat
 from functools import reduce
+from multiprocessing import Pool
+from Bio import SeqIO
 
 ###############################
 # CONSTANTS, GLOBAL VARIABLES #
@@ -435,16 +440,29 @@ class FastaIterator:
                 self.seq += re.sub("\s", "", line)
 
     def __next__(self):
-
+        print("next called", flush=True)
         if self.RUNTYPE == 'seqwise':
             if self._read_sequence():
+                print(self.id)
                 return self.id, self.seq, self.startpos
+            else:
+                print("stop iteration\n")
+                raise StopIteration
         elif self.RUNTYPE == 'chunkwise':
             if self._read_chunk():
                 return self.id, self.seq, self.startpos
+            else:
+                print("stop iteration")
+                raise StopIteration
+        else:
+            print("unknown RUNTYPE")
+            raise Exception("unknown RUNTYPE")
+            
+    def __iter__(self):
+        print("iter")
+        return self       
 
     def close(self):
-
         self.fi.close()
 
 
@@ -845,7 +863,7 @@ class SINEFinder(MotifFinder):
             args['name'] += "_%s-%s" % (args['start'], args['end'])
             mm.append(self.__class__.outformat[formattype] % args)
         return ''.join(mm)
-
+    
     # METHODS FOR TSD RECOGNITION
 
     def get_best_match(self, seq1, seq2):
@@ -1019,6 +1037,18 @@ class SINEFinder(MotifFinder):
 ###########
 # HELPERS #
 ###########
+    
+def process(seq, kwargs):
+    id = seq.id
+    seq = str(seq.seq)
+    # Convert to upper case
+    seq = seq.upper()
+    offset = 0
+    sf = SINEFinder(**kwargs)
+    sf.set_sequence(id, seq, offset)
+    sf.search(kwargs['TSD_ORIENTATION'])
+    sf.evaluate_TSD()
+    return sf
 
 def run(seqfile, **kwargs):
     """The run-function is responsible for the analysis."""
@@ -1034,8 +1064,9 @@ def run(seqfile, **kwargs):
     # Creating the instances, opening the file handle(s) for the result file(s)
     # and defining the variables.
 
-    fi = FastaIterator(seqfile, **kwargs)
-    sf = SINEFinder(**kwargs)
+    # fi = FastaIterator(seqfile, **kwargs)
+    # fi = bb.FastaReader(seqfile).to_arrow()
+    fi = SeqIO.parse(seqfile, 'fasta')
 
     matchfile = '.'.join(seqfile.split('.')[:-1]) + "-matches"
     fw = {}
@@ -1044,27 +1075,15 @@ def run(seqfile, **kwargs):
     if kwargs['OUTTYPE'] in ('csv', 'both'):
         fw['csv'] = open("%s.csv" % matchfile, 'a')
 
-    i, id, seq, offset = 0, '', '', 0
+     # start processing
+    with Pool(processes=128) as pool:
+        sfs = pool.starmap(process, zip(fi, repeat(kwargs)), 1)
 
-    # start processing
-
-    while 1:
-        e = next(fi)
-        if e:
-            (id, seq, offset) = e
-            if kwargs['verbose'] == 1:
-                print("\n   processing (%s) '%s', segment %s:%s" % (i, id, offset, offset + len(seq)), 'SEQLEN=',
-                      len(seq))
-            sf.set_sequence(id, seq, offset)
-            sf.search(kwargs['TSD_ORIENTATION'])
-            sf.evaluate_TSD()
-            if kwargs['OUTTYPE'] in ('fasta', 'both'):
-                fw['fasta'].write(sf.matches_as_fasta(['TSD_1', 'a_box', 'b_box', 'polyA', 'TSD_2']))
-            if kwargs['OUTTYPE'] in ('csv', 'both'):
-                fw['csv'].write(sf.matches_as_csv(['TSD_1', 'a_box', 'b_box', 'polyA', 'TSD_2']))
-            i += 1
-        else:
-            break
+    for sf in sfs:
+        if kwargs['OUTTYPE'] in ('fasta', 'both'):
+            fw['fasta'].write(sf.matches_as_fasta(['TSD_1', 'a_box', 'b_box', 'polyA', 'TSD_2']))
+        if kwargs['OUTTYPE'] in ('csv', 'both'):
+            fw['csv'].write(sf.matches_as_csv(['TSD_1', 'a_box', 'b_box', 'polyA', 'TSD_2']))
 
     # clean up
 
